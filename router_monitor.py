@@ -22,6 +22,7 @@ from collections import defaultdict, deque
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import numpy as np
+import random # Added for simulated packet loss
 
 # --- CONFIGURATION ---
 ROUTER_IP = '0.0.0.0'  # Listen on all interfaces
@@ -36,6 +37,8 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+SHARED_SECRET = 'SHARED_SECRET'  # Shared authentication token
 
 class EnhancedRouterMonitor:
     def __init__(self):
@@ -74,6 +77,23 @@ class EnhancedRouterMonitor:
         self.transfer_sizes = deque(maxlen=100)
         self.permission_decisions = deque(maxlen=100)
 
+        self.qos_latencies = []  # List of all latencies (seconds)
+        self.qos_throughputs = []  # List of all throughputs (bytes/sec)
+        self.qos_last_latency = None
+        self.qos_last_throughput = None
+        self.qos_lock = threading.Lock()
+
+        # Add new data tracking for bandwidth and packet loss
+        self.bandwidth_history = deque(maxlen=100)  # (timestamp, Mbps)
+        self.latency_history = deque(maxlen=100)    # (timestamp, latency)
+        self.jitter_history = deque(maxlen=100)     # (timestamp, jitter)
+        self.packet_loss_history = deque(maxlen=100) # (timestamp, loss%)
+        self.last_transfer_time = None
+        self.last_transfer_count = 0
+        self.last_latency = None
+        self.simulated_total_packets = 0
+        self.simulated_lost_packets = 0
+
         self.setup_gui()
 
     def setup_gui(self):
@@ -103,7 +123,7 @@ class EnhancedRouterMonitor:
         
         # Logs tab
         self.create_logs_tab(notebook)
-
+        self.create_qos_tab(notebook)  # <-- Add new QoS tab
         # Control buttons
         self.create_control_buttons(main_frame)
 
@@ -221,44 +241,60 @@ class EnhancedRouterMonitor:
         analysis_frame = ttk.Frame(notebook)
         notebook.add(analysis_frame, text="Traffic Analysis")
 
-        # Create matplotlib figure for charts
-        self.fig, ((self.ax1, self.ax2), (self.ax3, self.ax4)) = plt.subplots(2, 2, figsize=(14, 10))
-        self.fig.patch.set_facecolor('#2b2b2b')
+        # Add a description at the top
+        desc = (
+            "Traffic Analysis Overview:\n"
+            "1. Transfer Volume Over Time: Number of file transfers per minute.\n"
+            "2. Bandwidth Utilization: Network usage in Mbps over time.\n"
+            "3. Latency and Jitter: Transfer delay and its variation.\n"
+            "4. File Size vs. Transfer Time: Each dot is a file transfer (time vs. size)."
+        )
+        desc_label = ttk.Label(analysis_frame, text=desc, font=("Arial", 11, "italic"), anchor="w", justify="left")
+        desc_label.pack(fill=tk.X, padx=10, pady=(10, 0))
 
-        # Transfer volume chart
-        self.ax1.set_title('Transfer Volume Over Time', color='white')
-        self.ax1.set_ylabel('Transfers', color='white')
-        self.ax1.set_facecolor('#1e1e1e')
-        self.ax1.grid(True, alpha=0.3)
-        self.ax1.tick_params(colors='white')
+        # Create matplotlib figure for charts (2x2 grid)
+        self.fig, ((self.ax1, self.ax2), (self.ax3, self.ax4)) = plt.subplots(2, 2, figsize=(16, 10))
+        self.fig.patch.set_facecolor('#23272e')
+        self.fig.subplots_adjust(hspace=0.35, wspace=0.25)
 
-        # Permission decisions chart
-        self.ax2.set_title('Permission Decisions', color='white')
-        self.ax2.set_ylabel('Count', color='white')
-        self.ax2.set_facecolor('#1e1e1e')
-        self.ax2.tick_params(colors='white')
+        # ax1: Transfer volume
+        self.ax1.set_title('Transfer Volume Over Time', color='#1f77b4', fontsize=15, fontweight='bold', pad=12)
+        self.ax1.set_ylabel('Transfers/min', color='#1f77b4', fontsize=12, fontweight='bold', labelpad=8)
+        self.ax1.set_xlabel('Time (seconds since start)', color='#1f77b4', fontsize=12, fontweight='bold', labelpad=8)
+        self.ax1.set_facecolor('#181c20')
+        self.ax1.grid(True, alpha=0.25, color='#aaa', linestyle='--')
+        self.ax1.tick_params(colors='#1f77b4', labelsize=10)
 
-        # Transfer sizes chart
-        self.ax3.set_title('Transfer Sizes Distribution', color='white')
-        self.ax3.set_ylabel('Size (KB)', color='white')
-        self.ax3.set_facecolor('#1e1e1e')
-        self.ax3.grid(True, alpha=0.3)
-        self.ax3.tick_params(colors='white')
+        # ax2: Bandwidth
+        self.ax2.set_title('Bandwidth Utilization (Mbps)', color='#2ca02c', fontsize=15, fontweight='bold', pad=12)
+        self.ax2.set_ylabel('Mbps', color='#2ca02c', fontsize=12, fontweight='bold', labelpad=8)
+        self.ax2.set_xlabel('Time (seconds since start)', color='#2ca02c', fontsize=12, fontweight='bold', labelpad=8)
+        self.ax2.set_facecolor('#181c20')
+        self.ax2.grid(True, alpha=0.25, color='#aaa', linestyle='--')
+        self.ax2.tick_params(colors='#2ca02c', labelsize=10)
 
-        # Department activity chart
-        self.ax4.set_title('Department Activity', color='white')
-        self.ax4.set_ylabel('Transfers', color='white')
-        self.ax4.set_facecolor('#1e1e1e')
-        self.ax4.tick_params(colors='white')
+        # ax3: Latency/Jitter
+        self.ax3.set_title('Latency and Jitter Over Time', color='#d62728', fontsize=15, fontweight='bold', pad=12)
+        self.ax3.set_ylabel('Seconds', color='#d62728', fontsize=12, fontweight='bold', labelpad=8)
+        self.ax3.set_xlabel('Time (seconds since start)', color='#d62728', fontsize=12, fontweight='bold', labelpad=8)
+        self.ax3.set_facecolor('#181c20')
+        self.ax3.grid(True, alpha=0.25, color='#aaa', linestyle='--')
+        self.ax3.tick_params(colors='#d62728', labelsize=10)
+
+        # ax4: File size vs. time
+        self.ax4.set_title('File Size vs. Transfer Time', color='#9467bd', fontsize=15, fontweight='bold', pad=12)
+        self.ax4.set_xlabel('Time (seconds since start)', color='#9467bd', fontsize=12, fontweight='bold', labelpad=8)
+        self.ax4.set_ylabel('File Size (bytes)', color='#9467bd', fontsize=12, fontweight='bold', labelpad=8)
+        self.ax4.set_facecolor('#181c20')
+        self.ax4.grid(True, alpha=0.25, color='#aaa', linestyle='--')
+        self.ax4.tick_params(colors='#9467bd', labelsize=10)
 
         # Embed chart in tkinter
         self.canvas = FigureCanvasTkAgg(self.fig, analysis_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
         # Chart controls
         chart_controls_frame = ttk.Frame(analysis_frame)
         chart_controls_frame.pack(fill=tk.X, padx=10, pady=5)
-        
         ttk.Button(chart_controls_frame, text="Refresh Charts", command=self.update_charts).pack(side=tk.LEFT, padx=5)
         ttk.Button(chart_controls_frame, text="Clear Chart Data", command=self.clear_chart_data).pack(side=tk.LEFT, padx=5)
         ttk.Button(chart_controls_frame, text="Export Charts", command=self.export_charts).pack(side=tk.LEFT, padx=5)
@@ -283,6 +319,34 @@ class EnhancedRouterMonitor:
 
         ttk.Button(log_controls_frame, text="Clear Logs", command=self.clear_logs).pack(side=tk.LEFT, padx=5)
         ttk.Button(log_controls_frame, text="Export Logs", command=self.export_logs).pack(side=tk.LEFT, padx=5)
+
+    def create_qos_tab(self, notebook):
+        qos_frame = ttk.Frame(notebook)
+        notebook.add(qos_frame, text="QoS Report")
+        self.qos_latency_var = tk.StringVar(value="-")
+        self.qos_throughput_var = tk.StringVar(value="-")
+        self.qos_jitter_var = tk.StringVar(value="-")
+        self.qos_count_var = tk.StringVar(value="0")
+        self.qos_packet_count_var = tk.StringVar(value="0")  # New: for packet count
+        self.qos_chunk_count_var = tk.StringVar(value="0")   # New: for chunk count
+        # Layout
+        ttk.Label(qos_frame, text="Quality of Service (QoS) Metrics", font=("Arial", 14, "bold")).pack(pady=10)
+        stats_frame = ttk.Frame(qos_frame)
+        stats_frame.pack(pady=10)
+        ttk.Label(stats_frame, text="Latency (s):", font=("Arial", 11)).grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
+        ttk.Label(stats_frame, textvariable=self.qos_latency_var, font=("Arial", 11, "bold")).grid(row=0, column=1, sticky=tk.W, padx=10, pady=5)
+        ttk.Label(stats_frame, text="Throughput (bytes/sec):", font=("Arial", 11)).grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
+        ttk.Label(stats_frame, textvariable=self.qos_throughput_var, font=("Arial", 11, "bold")).grid(row=1, column=1, sticky=tk.W, padx=10, pady=5)
+        ttk.Label(stats_frame, text="Jitter (s):", font=("Arial", 11)).grid(row=2, column=0, sticky=tk.W, padx=10, pady=5)
+        ttk.Label(stats_frame, textvariable=self.qos_jitter_var, font=("Arial", 11, "bold")).grid(row=2, column=1, sticky=tk.W, padx=10, pady=5)
+        ttk.Label(stats_frame, text="Total Transfers Measured:", font=("Arial", 11)).grid(row=3, column=0, sticky=tk.W, padx=10, pady=5)
+        ttk.Label(stats_frame, textvariable=self.qos_count_var, font=("Arial", 11, "bold")).grid(row=3, column=1, sticky=tk.W, padx=10, pady=5)
+        # New: Add packet and chunk count to QoS tab
+        ttk.Label(stats_frame, text="Packets Sent (last transfer):", font=("Arial", 11)).grid(row=4, column=0, sticky=tk.W, padx=10, pady=5)
+        ttk.Label(stats_frame, textvariable=self.qos_packet_count_var, font=("Arial", 11, "bold")).grid(row=4, column=1, sticky=tk.W, padx=10, pady=5)
+        ttk.Label(stats_frame, text="Chunks Sent (last transfer):", font=("Arial", 11)).grid(row=5, column=0, sticky=tk.W, padx=10, pady=5)
+        ttk.Label(stats_frame, textvariable=self.qos_chunk_count_var, font=("Arial", 11, "bold")).grid(row=5, column=1, sticky=tk.W, padx=10, pady=5)
+        ttk.Button(qos_frame, text="Refresh QoS Report", command=self.update_qos_report).pack(pady=10)
 
     def create_control_buttons(self, parent):
         button_frame = ttk.Frame(parent)
@@ -416,22 +480,36 @@ class EnhancedRouterMonitor:
         file_name = event.get('file_name', 'Unknown')
         file_size = event.get('file_size', 0)
         file_data = event.get('file_data', '')
-        
+        auth_token = event.get('auth_token', None)
+        send_time = event.get('timestamp', None)
+        recv_time = time.time()
+        # Authentication check
+        if auth_token != SHARED_SECRET:
+            allowed = False
+            self.log(f"[SECURITY] Authentication failed for file transfer from {src} to {dst} ({file_name}). Provided token: {auth_token}")
+            # Respond to agent immediately and return
+            response = {
+                'type': 'file_transfer_response',
+                'allowed': False,
+                'message': 'File transfer denied: authentication failed (invalid shared secret)'
+            }
+            try:
+                self.connections[src].send(json.dumps(response).encode())
+            except:
+                pass
+            return
         allowed = self.permission_matrix.get((src, dst), False)
-        
-        # Update statistics
+        # Update statistics (only for allowed/denied counts, not for charts)
         self.stats['total_transfers'] += 1
         if allowed:
             self.stats['allowed_transfers'] += 1
         else:
             self.stats['denied_transfers'] += 1
-            
         if src == 'VLAN10':
             self.stats['vlan10_transfers'] += 1
         else:
             self.stats['vlan20_transfers'] += 1
-
-        # Log the transfer
+        # Log the transfer (for history, not for charts)
         timestamp = datetime.datetime.now()
         transfer_info = {
             'timestamp': timestamp,
@@ -443,7 +521,6 @@ class EnhancedRouterMonitor:
             'allowed': allowed
         }
         self.transfer_history.append(transfer_info)
-        
         # Add to treeview
         self.safe_gui_update(lambda: self.transfer_tree.insert('', 0, values=(
             timestamp.strftime('%H:%M:%S'),
@@ -454,20 +531,10 @@ class EnhancedRouterMonitor:
             'Allowed' if allowed else 'Denied',
             file_name
         )))
-
         # Update activity log
         activity_msg = f"[{timestamp.strftime('%H:%M:%S')}] {src} -> {dst} | File: {file_name} | {'ALLOWED' if allowed else 'DENIED'}"
         self.safe_gui_update(lambda: self.activity_text.insert(tk.END, activity_msg + '\n'))
         self.safe_gui_update(lambda: self.activity_text.see(tk.END))
-
-        # Store data for charts
-        self.transfer_times.append(time.time())
-        self.transfer_sizes.append(file_size)
-        self.permission_decisions.append(1 if allowed else 0)
-
-        # Update charts immediately
-        self.safe_gui_update(self.update_charts)
-
         # Respond to agent
         response = {
             'type': 'file_transfer_response',
@@ -478,39 +545,76 @@ class EnhancedRouterMonitor:
             self.connections[src].send(json.dumps(response).encode())
         except:
             pass
-
-        # Forward file to destination if allowed
+        # Only update charts and QoS if transfer is allowed and forwarded
         if allowed and dst in self.connections:
             forward_file = {
                 'type': 'file_received',
                 'sender': src,
                 'file_name': file_name,
                 'file_size': file_size,
-                'file_data': file_data
+                'file_data': file_data,
+                'file_hash': event.get('file_hash', None)  # Forward the hash
             }
             try:
-                # Send file data in chunks if it's large
                 json_data = json.dumps(forward_file)
                 data_bytes = json_data.encode('utf-8')
-                
-                # Send in chunks if necessary
                 chunk_size = 8192  # 8KB chunks
                 total_sent = 0
-                
+                chunk_count = 0
+                packet_sizes = []
+                # --- Router-side timing start ---
+                start_time = time.time()
                 while total_sent < len(data_bytes):
                     chunk = data_bytes[total_sent:total_sent + chunk_size]
                     sent = self.connections[dst].send(chunk)
                     if sent == 0:
                         raise Exception("Connection broken")
                     total_sent += sent
-                
-                # Add a small delay to ensure all data is sent
+                    chunk_count += 1
+                    packet_sizes.append(len(chunk))
+                    self.log(f"[PACKET] Chunk {chunk_count}: {len(chunk)} bytes sent")
                 time.sleep(0.1)
-                
-                self.log(f"[FORWARD] File forwarded from {src} to {dst}")
+                end_time = time.time()  # --- Router-side timing end ---
+                self.log(f"[FORWARD] File forwarded from {src} to {dst} in {chunk_count} chunk(s)")
+                self.safe_gui_update(lambda: self.qos_chunk_count_var.set(str(chunk_count)))
+                self.safe_gui_update(lambda: self.qos_packet_count_var.set(str(chunk_count)))
+                self.log(f"[PACKET SIZES] Last transfer packet sizes: {packet_sizes}")
+                # --- QoS metrics using router-side timing ---
+                latency = end_time - start_time
+                if latency < 0:
+                    self.log("[WARNING] Negative latency detected in router-side timing. Setting latency to 0.")
+                    latency = 0.0
+                if latency > 0:
+                    throughput = file_size / latency
+                else:
+                    throughput = 0.0
+                now = end_time
+                # Only here: update chart data and QoS
+                self.transfer_times.append(now)
+                self.transfer_sizes.append(file_size)
+                self.permission_decisions.append(1)
+                # Bandwidth calculation (Mbps)
+                if self.last_transfer_time is not None:
+                    time_delta = now - self.last_transfer_time
+                    if time_delta > 0:
+                        bytes_delta = sum(list(self.transfer_sizes)[-2:])
+                        mbps = (bytes_delta * 8) / (time_delta * 1_000_000)
+                        self.bandwidth_history.append((now, mbps))
+                self.last_transfer_time = now
+                self.latency_history.append((now, latency))
+                if self.last_latency is not None:
+                    jitter = abs(latency - self.last_latency)
+                    self.jitter_history.append((now, jitter))
+                self.last_latency = latency
+                with self.qos_lock:
+                    self.qos_latencies.append(latency)
+                    self.qos_throughputs.append(throughput)
+                    self.qos_last_latency = latency
+                    self.qos_last_throughput = throughput
+                self.safe_gui_update(self.update_charts)
+                self.safe_gui_update(self.update_qos_report)
             except Exception as e:
                 self.log(f"[ERROR] Failed to forward file to {dst}: {e}")
-                # Mark the destination as disconnected
                 if dst in self.connections:
                     try:
                         self.connections[dst].close()
@@ -519,15 +623,55 @@ class EnhancedRouterMonitor:
                     del self.connections[dst]
                     self.agent_status[dst]['status'] = 'Disconnected'
                     self.safe_gui_update(lambda v=dst: self.agent_vars[v].set("Disconnected"))
+        else:
+            # If not allowed, reset chunk/packet count and do NOT update charts/QoS
+            self.safe_gui_update(lambda: self.qos_chunk_count_var.set("0"))
+            self.safe_gui_update(lambda: self.qos_packet_count_var.set("0"))
 
         self.log(f"[TRANSFER] {src} -> {dst} | File: {file_name} | {'ALLOWED' if allowed else 'DENIED'}")
+
+        # QoS measurement
+        # with self.qos_lock: # This block is now redundant as latency/throughput are calculated in the forwarding loop
+        #     if 'timestamp' in event and event['timestamp'] is not None:
+        #         latency = recv_time - event['timestamp']
+        #         if latency < 0:
+        #             self.log("[WARNING] Negative latency detected. Possible clock skew between sender and router. Setting latency to 0.")
+        #             latency = 0.0
+        #     else:
+        #         latency = 0.0
+        #     self.qos_latencies.append(latency)
+        #     if latency > 0:
+        #         throughput = file_size / latency
+        #     else:
+        #         throughput = 0.0
+        #     self.qos_throughputs.append(throughput)
+        #     self.qos_last_latency = latency
+        #     self.qos_last_throughput = throughput
+        # self.safe_gui_update(self.update_qos_report)
 
     def handle_message_transfer_request(self, vlan, event):
         src = vlan
         dst = event.get('dst_vlan')
         message = event.get('message', '')
         message_type = event.get('message_type', 'text')
-        
+        auth_token = event.get('auth_token', None)
+        send_time = event.get('timestamp', None)
+        recv_time = time.time()
+        # Authentication check
+        if auth_token != SHARED_SECRET:
+            allowed = False
+            self.log(f"[SECURITY] Authentication failed for message transfer from {src} to {dst}. Provided token: {auth_token}")
+            # Respond to agent immediately and return
+            response = {
+                'type': 'message_transfer_response',
+                'allowed': False,
+                'message': 'Message transfer denied: authentication failed (invalid shared secret)'
+            }
+            try:
+                self.connections[src].send(json.dumps(response).encode())
+            except:
+                pass
+            return
         allowed = self.permission_matrix.get((src, dst), False)
         
         # Update statistics
@@ -606,6 +750,22 @@ class EnhancedRouterMonitor:
 
         self.log(f"[TRANSFER] {src} -> {dst} | {message_type.capitalize()}: {message[:30]}... | {'ALLOWED' if allowed else 'DENIED'}")
 
+        # QoS measurement
+        # with self.qos_lock: # This block is now redundant as latency/throughput are calculated in the forwarding loop
+        #     if 'timestamp' in event and event['timestamp'] is not None:
+        #         latency = recv_time - event['timestamp']
+        #     else:
+        #         latency = 0.0
+        #     self.qos_latencies.append(latency)
+        #     if latency > 0:
+        #         throughput = len(message.encode()) / latency
+        #     else:
+        #         throughput = 0.0
+        #     self.qos_throughputs.append(throughput)
+        #     self.qos_last_latency = latency
+        #     self.qos_last_throughput = throughput
+        # self.safe_gui_update(self.update_qos_report)
+
     def update_permissions(self):
         for (src, dst), var in self.perm_vars.items():
             self.permission_matrix[(src, dst)] = var.get()
@@ -655,72 +815,84 @@ class EnhancedRouterMonitor:
             # Clear all axes
             for ax in [self.ax1, self.ax2, self.ax3, self.ax4]:
                 ax.clear()
-
-            # Transfer volume over time
-            self.ax1.set_title('Transfer Volume Over Time', color='white')
-            self.ax1.set_ylabel('Transfers', color='white')
-            self.ax1.set_facecolor('#1e1e1e')
-            self.ax1.grid(True, alpha=0.3)
-            self.ax1.tick_params(colors='white')
-            
+            # --- ax1: Traffic volume over time ---
+            self.ax1.set_title('Transfer Volume Over Time', color='#1f77b4', fontsize=15, fontweight='bold', pad=12)
+            self.ax1.set_ylabel('Transfers/min', color='#1f77b4', fontsize=12, fontweight='bold', labelpad=8)
+            self.ax1.set_xlabel('Time (seconds since start)', color='#1f77b4', fontsize=12, fontweight='bold', labelpad=8)
+            self.ax1.set_facecolor('#181c20')
+            self.ax1.grid(True, alpha=0.25, color='#aaa', linestyle='--')
+            self.ax1.tick_params(colors='#1f77b4', labelsize=10)
             if self.transfer_times:
-                # Group transfers by minute
-                times = list(self.transfer_times)
+                times = np.array(self.transfer_times)
+                t0 = times.min()
+                rel_times = times - t0
                 if len(times) > 1:
-                    time_bins = np.linspace(min(times), max(times), min(10, len(times)))
-                    counts, _ = np.histogram(times, bins=time_bins)
-                    self.ax1.plot(time_bins[:-1], counts, 'g-', linewidth=2, marker='o')
+                    min_time = rel_times.min()
+                    max_time = rel_times.max()
+                    bins = np.arange(min_time, max_time + 60, 60)
+                    counts, edges = np.histogram(rel_times, bins=bins)
+                    self.ax1.plot(edges[:-1], counts, color='#1f77b4', linewidth=2, marker='o', label='Transfers/min')
+                    self.ax1.legend()
                 else:
-                    # Single transfer
-                    self.ax1.bar([0], [1], color='green', alpha=0.7)
+                    self.ax1.plot([rel_times[0]], [1], 'o', color='#1f77b4', label='Single Transfer')
+                    self.ax1.legend()
             else:
-                # No data yet
-                self.ax1.text(0.5, 0.5, 'No transfers yet', ha='center', va='center', 
-                             transform=self.ax1.transAxes, color='white', fontsize=12)
-
-            # Permission decisions
-            self.ax2.set_title('Permission Decisions', color='white')
-            self.ax2.set_ylabel('Count', color='white')
-            self.ax2.set_facecolor('#1e1e1e')
-            self.ax2.tick_params(colors='white')
-            
-            if self.permission_decisions:
-                allowed = sum(self.permission_decisions)
-                denied = len(self.permission_decisions) - allowed
-                self.ax2.bar(['Allowed', 'Denied'], [allowed, denied], color=['green', 'red'])
+                self.ax1.text(0.5, 0.5, 'No transfers yet', ha='center', va='center', transform=self.ax1.transAxes, color='#1f77b4', fontsize=12)
+            # --- ax2: Bandwidth utilization ---
+            self.ax2.set_title('Bandwidth Utilization (Mbps)', color='#2ca02c', fontsize=15, fontweight='bold', pad=12)
+            self.ax2.set_ylabel('Mbps', color='#2ca02c', fontsize=12, fontweight='bold', labelpad=8)
+            self.ax2.set_xlabel('Time (seconds since start)', color='#2ca02c', fontsize=12, fontweight='bold', labelpad=8)
+            self.ax2.set_facecolor('#181c20')
+            self.ax2.grid(True, alpha=0.25, color='#aaa', linestyle='--')
+            self.ax2.tick_params(colors='#2ca02c', labelsize=10)
+            if self.bandwidth_history:
+                times, mbps = zip(*self.bandwidth_history)
+                t0 = min(times)
+                rel_times = np.array(times) - t0
+                self.ax2.plot(rel_times, mbps, color='#2ca02c', linewidth=2, marker='o', label='Mbps')
+                self.ax2.legend()
             else:
-                # No data yet
-                self.ax2.text(0.5, 0.5, 'No decisions yet', ha='center', va='center', 
-                             transform=self.ax2.transAxes, color='white', fontsize=12)
-
-            # Transfer sizes
-            self.ax3.set_title('Transfer Sizes Distribution', color='white')
-            self.ax3.set_ylabel('Size (bytes)', color='white')
-            self.ax3.set_facecolor('#1e1e1e')
-            self.ax3.grid(True, alpha=0.3)
-            self.ax3.tick_params(colors='white')
-            
-            if self.transfer_sizes:
-                sizes = list(self.transfer_sizes)
-                self.ax3.hist(sizes, bins=min(10, len(sizes)), color='blue', alpha=0.7)
+                self.ax2.text(0.5, 0.5, 'No bandwidth data', ha='center', va='center', transform=self.ax2.transAxes, color='#2ca02c', fontsize=12)
+            # --- ax3: Latency and Jitter ---
+            self.ax3.set_title('Latency and Jitter Over Time', color='#d62728', fontsize=15, fontweight='bold', pad=12)
+            self.ax3.set_ylabel('Seconds', color='#d62728', fontsize=12, fontweight='bold', labelpad=8)
+            self.ax3.set_xlabel('Time (seconds since start)', color='#d62728', fontsize=12, fontweight='bold', labelpad=8)
+            self.ax3.set_facecolor('#181c20')
+            self.ax3.grid(True, alpha=0.25, color='#aaa', linestyle='--')
+            self.ax3.tick_params(colors='#d62728', labelsize=10)
+            if self.latency_history:
+                t_lat, lat = zip(*self.latency_history)
+                t0 = min(t_lat)
+                rel_t_lat = np.array(t_lat) - t0
+                self.ax3.plot(rel_t_lat, lat, color='#d62728', linewidth=2, marker='o', label='Latency')
+            if self.jitter_history:
+                t_jit, jit = zip(*self.jitter_history)
+                t0 = min(t_jit)
+                rel_t_jit = np.array(t_jit) - t0
+                self.ax3.plot(rel_t_jit, jit, color='#ff7f0e', linewidth=2, marker='x', label='Jitter')
+            if self.latency_history or self.jitter_history:
+                self.ax3.legend()
             else:
-                # No data yet
-                self.ax3.text(0.5, 0.5, 'No transfers yet', ha='center', va='center', 
-                             transform=self.ax3.transAxes, color='white', fontsize=12)
-
-            # Department activity
-            self.ax4.set_title('Department Activity', color='white')
-            self.ax4.set_ylabel('Transfers', color='white')
-            self.ax4.set_facecolor('#1e1e1e')
-            self.ax4.tick_params(colors='white')
-            
-            self.ax4.bar(['HR (VLAN10)', 'Finance (VLAN20)'], 
-                        [self.stats['vlan10_transfers'], self.stats['vlan20_transfers']], 
-                        color=['orange', 'purple'])
-
+                self.ax3.text(0.5, 0.5, 'No latency/jitter data', ha='center', va='center', transform=self.ax3.transAxes, color='#d62728', fontsize=12)
+            # --- ax4: File size vs. transfer time ---
+            self.ax4.set_title('File Size vs. Transfer Time', color='#9467bd', fontsize=15, fontweight='bold', pad=12)
+            self.ax4.set_xlabel('Time (seconds since start)', color='#9467bd', fontsize=12, fontweight='bold', labelpad=8)
+            self.ax4.set_ylabel('File Size (bytes)', color='#9467bd', fontsize=12, fontweight='bold', labelpad=8)
+            self.ax4.set_facecolor('#181c20')
+            self.ax4.grid(True, alpha=0.25, color='#aaa', linestyle='--')
+            self.ax4.tick_params(colors='#9467bd', labelsize=10)
+            if self.transfer_times and self.transfer_sizes:
+                times = np.array(self.transfer_times)
+                t0 = times.min()
+                rel_times = times - t0
+                sizes = np.array(self.transfer_sizes)
+                self.ax4.scatter(rel_times, sizes, c='#00bfff', edgecolors='k', label='File Transfers', s=80)
+                self.ax4.legend()
+            else:
+                self.ax4.text(0.5, 0.5, 'No file transfer data', ha='center', va='center', transform=self.ax4.transAxes, color='#9467bd', fontsize=12)
+            self.fig.tight_layout(pad=2.0)
             # Redraw canvas
             self.canvas.draw()
-
         except Exception as e:
             self.log(f"[ERROR] Chart update error: {e}")
 
@@ -764,6 +936,10 @@ class EnhancedRouterMonitor:
         self.transfer_times.clear()
         self.transfer_sizes.clear()
         self.permission_decisions.clear()
+        self.bandwidth_history.clear()
+        self.latency_history.clear()
+        self.jitter_history.clear()
+        self.packet_loss_history.clear()
         self.update_charts()
         messagebox.showinfo("Charts", "Chart data cleared!")
     
@@ -775,6 +951,34 @@ class EnhancedRouterMonitor:
             messagebox.showinfo("Export", f"Charts exported to {fname}")
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export charts: {e}")
+
+    def update_qos_report(self):
+        with self.qos_lock:
+            if self.qos_latencies:
+                avg_latency = sum(self.qos_latencies) / len(self.qos_latencies)
+                min_latency = min(self.qos_latencies)
+                max_latency = max(self.qos_latencies)
+                latency_str = f"avg={avg_latency:.4f}, min={min_latency:.4f}, max={max_latency:.4f}"
+            else:
+                latency_str = "No data"
+            if self.qos_throughputs:
+                avg_throughput = sum(self.qos_throughputs) / len(self.qos_throughputs)
+                min_throughput = min(self.qos_throughputs)
+                max_throughput = max(self.qos_throughputs)
+                throughput_str = f"avg={avg_throughput:.2f}, min={min_throughput:.2f}, max={max_throughput:.2f}"
+            else:
+                throughput_str = "No data"
+            if len(self.qos_latencies) > 1:
+                jitters = [abs(self.qos_latencies[i] - self.qos_latencies[i-1]) for i in range(1, len(self.qos_latencies))]
+                avg_jitter = sum(jitters) / len(jitters)
+                jitter_str = f"avg={avg_jitter:.6f}"
+            else:
+                jitter_str = "Not enough data"
+            self.qos_latency_var.set(latency_str)
+            self.qos_throughput_var.set(throughput_str)
+            self.qos_jitter_var.set(jitter_str)
+            self.qos_count_var.set(str(len(self.qos_latencies)))
+            # New: Do not update chunk/packet count here, it's per-transfer
 
     def log(self, msg):
         self.safe_gui_update(lambda: self.logs_text.insert(tk.END, msg + '\n'))
