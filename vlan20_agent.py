@@ -20,12 +20,14 @@ import os
 import base64
 from PIL import Image, ImageTk
 import io
+import hashlib
 
 # --- CONFIGURATION ---
-ROUTER_IP = '172.17.2.20'  # Router PC's WiFi IP address for multi-PC connection
+ROUTER_IP = '127.0.0.1'  # Router PC's WiFi IP address for multi-PC connection
 ROUTER_PORT = 50050
 VLAN = 'VLAN20'
 LOCAL_DEPT = 'Finance'
+SHARED_SECRET = 'SHARED_SECRET'  # Shared authentication token
 
 logging.basicConfig(
     level=logging.INFO,
@@ -315,10 +317,10 @@ class EnhancedVLAN20Agent:
     def connect_to_router(self):
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(1000)  # 30 second timeout for operations
+            #self.sock.settimeout(30)  # 30 second timeout for operations
             self.sock.connect((ROUTER_IP, ROUTER_PORT))
             # Send agent info
-            agent_info = {'vlan': VLAN, 'dept': LOCAL_DEPT}
+            agent_info = {'vlan': VLAN, 'dept': LOCAL_DEPT, 'timestamp': time.time()}
             self.sock.send(json.dumps(agent_info).encode())
             self.connected = True
             self.status_var.set("Connected")
@@ -402,9 +404,10 @@ class EnhancedVLAN20Agent:
                     sender = response.get('sender', 'Unknown')
                     message_type = response.get('message_type', 'text')
                     content = response.get('content', '')
+                    message_hash = response.get('message_hash', None)
                     
                     # Add to inbox
-                    self.add_received_message(sender, message_type, content)
+                    self.add_received_message(sender, message_type, content, message_hash)
                 
                 elif response_type == 'file_received':
                     # Handle received file
@@ -412,9 +415,10 @@ class EnhancedVLAN20Agent:
                     file_name = response.get('file_name', 'unknown_file')
                     file_size = response.get('file_size', 0)
                     file_data = response.get('file_data', '')
+                    file_hash = response.get('file_hash', None) # Get the hash from the response
                     
                     # Save the file
-                    self.save_received_file(sender, file_name, file_data)
+                    self.save_received_file(sender, file_name, file_data, file_hash)
                 
         except Exception as e:
             self.log(f"[ERROR] Router connection lost: {e}")
@@ -480,6 +484,8 @@ class EnhancedVLAN20Agent:
             
             # Encode file data as base64
             file_data_b64 = base64.b64encode(file_data).decode('utf-8')
+            file_hash = hashlib.sha256(file_data).hexdigest()
+            self.log(f"[DEBUG] SHA-256 hash for {os.path.basename(file_path)}: {file_hash}")
             
             # Check if the encoded data is too large for a single JSON message
             if len(file_data_b64) > 1000000:  # 1MB limit for JSON payload
@@ -494,7 +500,9 @@ class EnhancedVLAN20Agent:
                 'file_name': os.path.basename(file_path),
                 'file_size': len(file_data),
                 'file_data': file_data_b64,
-                'timestamp': time.time()
+                'file_hash': file_hash, # Include hash in the request
+                'auth_token': SHARED_SECRET,  # Shared token for authentication
+                'timestamp': time.time()  # Ensure timestamp is included
             }
             
             # Send to router with error handling
@@ -559,6 +567,8 @@ class EnhancedVLAN20Agent:
 
         try:
             message_type = self.msg_type_var.get()
+            message_hash = hashlib.sha256(message.encode('utf-8')).hexdigest()
+            self.log(f"[DEBUG] SHA-256 hash for message: {message_hash}")
             
             # Create transfer request
             event = {
@@ -567,11 +577,17 @@ class EnhancedVLAN20Agent:
                 'dst_vlan': self.msg_dest_var.get(),
                 'message': message,
                 'message_type': message_type,
-                'timestamp': time.time()
+                'message_hash': message_hash,
+                'auth_token': SHARED_SECRET,  # Shared token for authentication
+                'timestamp': time.time()  # Ensure timestamp is included
             }
             
             # Send to router
+            start_time = time.time()
             self.sock.send(json.dumps(event).encode())
+            end_time = time.time()
+            transfer_time = end_time - start_time
+            speed = len(message) / transfer_time if transfer_time > 0 else 0
             
             # Update statistics
             self.stats['sent_transfers'] += 1
@@ -584,7 +600,9 @@ class EnhancedVLAN20Agent:
                 'to': self.msg_dest_var.get(),
                 'size': len(message),
                 'status': 'Pending',
-                'details': message[:50] + '...' if len(message) > 50 else message
+                'details': message[:50] + '...' if len(message) > 50 else message,
+                'speed': speed,
+                'latency': transfer_time
             }
             self.transfer_history.append(transfer_info)
             
@@ -595,10 +613,10 @@ class EnhancedVLAN20Agent:
                 self.msg_dest_var.get(),
                 f"{len(message)} chars",
                 'Pending',
-                message[:50] + '...' if len(message) > 50 else message
+                (message[:50] + '...' if len(message) > 50 else message) + f" | Speed: {speed:.2f} B/s | Latency: {transfer_time:.2f}s"
             ))
             
-            self.log(f"[TRANSFER] Sent {message_type} message to {self.msg_dest_var.get()}")
+            self.log(f"[TRANSFER] Sent {message_type} message to {self.msg_dest_var.get()} | Speed: {speed:.2f} B/s | Latency: {transfer_time:.2f}s")
             self.activity_log(f"[TRANSFER] Sent {message_type} message to {self.msg_dest_var.get()}")
             
             # Clear message
@@ -690,14 +708,20 @@ class EnhancedVLAN20Agent:
         
         messagebox.showinfo("Export", f"Messages exported to {fname}")
 
-    def add_received_message(self, sender, message_type, content):
+    def add_received_message(self, sender, message_type, content, message_hash=None):
         """Add a received message to the inbox"""
         timestamp = datetime.datetime.now().strftime('%H:%M:%S')
+        if message_hash:
+            computed_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+            self.log(f"[DEBUG] Received message hash: {message_hash}, Computed hash: {computed_hash}")
+            if computed_hash != message_hash:
+                self.log(f"[SECURITY] Message hash mismatch from {sender}! Possible corruption or tampering.")
         message = {
             'timestamp': timestamp,
             'sender': sender,
             'type': message_type,
-            'content': content
+            'content': content,
+            'message_hash': message_hash  # Store the hash for export/inbox
         }
         self.received_messages.append(message)
         
@@ -711,11 +735,11 @@ class EnhancedVLAN20Agent:
         self.log(f"[RECEIVED] Message from {sender}: {content[:50]}...")
         self.activity_log(f"[RECEIVED] Message from {sender}")
 
-    def save_received_file(self, sender, file_name, file_data):
+    def save_received_file(self, sender, file_name, file_data, file_hash=None):
         """Save a received file to disk"""
         try:
             # Decode file data from base64
-            file_data_bytes = base64.b64decode(file_data)
+            file_data_decoded = base64.b64decode(file_data)
             
             # Create received_files directory if it doesn't exist
             received_dir = "received_files"
@@ -735,7 +759,7 @@ class EnhancedVLAN20Agent:
                 counter += 1
             
             with open(file_path, 'wb') as f:
-                f.write(file_data_bytes)
+                f.write(file_data_decoded)
             
             # Add to history
             timestamp = datetime.datetime.now()
@@ -743,7 +767,7 @@ class EnhancedVLAN20Agent:
                 'timestamp': timestamp,
                 'type': 'File',
                 'from': sender,
-                'size': len(file_data_bytes),
+                'size': len(file_data_decoded),
                 'status': 'Received',
                 'details': file_name
             }
@@ -754,7 +778,7 @@ class EnhancedVLAN20Agent:
                 timestamp.strftime('%H:%M:%S'),
                 'File',
                 sender,
-                f"{len(file_data_bytes)} bytes",
+                f"{len(file_data_decoded)} bytes",
                 'Received',
                 file_name
             ))
@@ -764,7 +788,7 @@ class EnhancedVLAN20Agent:
                 timestamp.strftime('%H:%M:%S'),
                 'File',
                 sender,
-                f"{len(file_data_bytes)} bytes",
+                f"{len(file_data_decoded)} bytes",
                 'Received',
                 file_name
             ))
@@ -774,6 +798,13 @@ class EnhancedVLAN20Agent:
             
             # Show success message
             messagebox.showinfo("File Received", f"File '{file_name}' received from {sender} and saved to {received_dir}/ directory.")
+            
+            if file_hash:
+                computed_hash = hashlib.sha256(file_data_decoded).hexdigest()
+                self.log(f"[DEBUG] Received hash: {file_hash}, Computed hash: {computed_hash}")
+                if computed_hash != file_hash:
+                    self.log(f"[SECURITY] File hash mismatch for {file_name} from {sender}! Possible corruption or tampering.")
+                    messagebox.showerror("Security Alert", f"File hash mismatch for {file_name} from {sender}! Possible corruption or tampering.")
             
         except Exception as e:
             self.log(f"[ERROR] Failed to save received file: {e}")
